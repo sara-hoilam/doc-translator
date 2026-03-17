@@ -1,0 +1,1 @@
+ALTER TABLE `jobs` ADD `previewPageCount` int DEFAULT 0;

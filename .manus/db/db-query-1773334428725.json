@@ -1,0 +1,22 @@
+{
+  "query": "SELECT id, previewPageCount FROM `jobs` LIMIT 3;",
+  "command": "mysql --batch --raw --column-names --default-character-set=utf8mb4 --host gateway04.us-east-1.prod.aws.tidbcloud.com --port 4000 --user E4xmMU2obgV7FHx.4d8952b34e27 --database KPMFPywrgcDKk6JQGpsMDm --execute SELECT id, previewPageCount FROM `jobs` LIMIT 3;",
+  "rows": [
+    {
+      "id": "2",
+      "previewPageCount": "0"
+    },
+    {
+      "id": "3",
+      "previewPageCount": "0"
+    },
+    {
+      "id": "4",
+      "previewPageCount": "0"
+    }
+  ],
+  "messages": [],
+  "stdout": "id\tpreviewPageCount\n2\t0\n3\t0\n4\t0\n",
+  "stderr": "",
+  "execution_time_ms": 1538
+}

@@ -1,0 +1,9 @@
+{
+  "query": "\nALTER TABLE jobs \n  MODIFY COLUMN status ENUM('pending','extracting','translating','converting','done','error','cancelled') NOT NULL DEFAULT 'pending',\n  ADD COLUMN cancelled TINYINT(1) NOT NULL DEFAULT 0;\n\nCREATE TABLE IF NOT EXISTS job_logs (\n  id INT AUTO_INCREMENT PRIMARY KEY,\n  jobId INT NOT NULL,\n  seq INT NOT NULL,\n  level ENUM('info','progress','success','warning','error') NOT NULL DEFAULT 'info',\n  message TEXT NOT NULL,\n  createdAt BIGINT NOT NULL,\n  INDEX idx_job_logs_jobId_seq (jobId, seq)\n);\n",
+  "command": "mysql --batch --raw --column-names --default-character-set=utf8mb4 --host gateway04.us-east-1.prod.aws.tidbcloud.com --port 4000 --user E4xmMU2obgV7FHx.4d8952b34e27 --database KPMFPywrgcDKk6JQGpsMDm --execute \nALTER TABLE jobs \n  MODIFY COLUMN status ENUM('pending','extracting','translating','converting','done','error','cancelled') NOT NULL DEFAULT 'pending',\n  ADD COLUMN cancelled TINYINT(1) NOT NULL DEFAULT 0;\n\nCREATE TABLE IF NOT EXISTS job_logs (\n  id INT AUTO_INCREMENT PRIMARY KEY,\n  jobId INT NOT NULL,\n  seq INT NOT NULL,\n  level ENUM('info','progress','success','warning','error') NOT NULL DEFAULT 'info',\n  message TEXT NOT NULL,\n  createdAt BIGINT NOT NULL,\n  INDEX idx_job_logs_jobId_seq (jobId, seq)\n);\n",
+  "rows": [],
+  "messages": [],
+  "stdout": "",
+  "stderr": "",
+  "execution_time_ms": 1147
+}

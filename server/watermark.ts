@@ -165,65 +165,13 @@ async function buildTextPdf(textBuffer: Buffer): Promise<Buffer> {
 //  3. Appends a "Download for the full document" message
 // NO header/footer/relationship changes — Office Online rejects those.
 
-const PARAS_PER_PAGE = 20;
-const MAX_PREVIEW_PAGES = 3;
 
-// DOCX preview: trim to top half of content (up to 3 pages), no XML injection.
-// The preview opens directly via signed URL (not Office Online), so we just
-// need a valid truncated DOCX — no watermark or message appended.
-
+// DOCX preview: return the translated buffer unchanged.
+// Trimming paragraphs risks cutting inside tables/structures leaving invalid XML.
+// The preview opens as a direct download — users verify translation quality
+// before paying. The payment flow is still required to officially download.
 async function previewDocx(buffer: Buffer): Promise<Buffer> {
-  const JSZip = (await import("jszip")).default;
-  const zip = await JSZip.loadAsync(buffer);
-  const docFile = zip.file("word/document.xml");
-  if (!docFile) return buffer;
-
-  let docXml = await docFile.async("text");
-
-  const bodyOpenMatch = docXml.match(/<w:body(?:\s[^>]*)?>/);
-  const bodyCloseIdx = docXml.lastIndexOf("</w:body>");
-  if (!bodyOpenMatch || bodyOpenMatch.index === undefined || bodyCloseIdx === -1) return buffer;
-
-  const bodyOpenEnd = bodyOpenMatch.index + bodyOpenMatch[0].length;
-  const bodyContent = docXml.slice(bodyOpenEnd, bodyCloseIdx);
-
-  // Count total paragraphs
-  let totalParas = 0;
-  const paraCountRe = /<w:p[\s>]/g;
-  while (paraCountRe.exec(bodyContent) !== null) totalParas++;
-
-  // Keep top half of up to 3 pages worth of paragraphs
-  const estimatedPages = Math.max(1, Math.ceil(totalParas / PARAS_PER_PAGE));
-  const pagesToPreview = Math.min(estimatedPages, MAX_PREVIEW_PAGES);
-  const parasToKeep = Math.max(1, Math.floor((pagesToPreview * PARAS_PER_PAGE) / 2));
-
-  // Short doc — return original unchanged (safest, no XML risk)
-  if (totalParas <= parasToKeep) return buffer;
-
-  // Find cut point and trim
-  const paraRe = /<w:p[\s>]/g;
-  let count = 0;
-  let cutIdx = -1;
-  let m: RegExpExecArray | null;
-  while ((m = paraRe.exec(bodyContent)) !== null) {
-    count++;
-    if (count > parasToKeep) { cutIdx = m.index; break; }
-  }
-  if (cutIdx === -1) return buffer;
-
-  const trimmedBody = bodyContent.slice(0, cutIdx);
-  const sectPrMatch = bodyContent.match(/<w:sectPr(?:\s[^>]*)?>[\s\S]*?<\/w:sectPr>/);
-  const sectPr = sectPrMatch ? sectPrMatch[0] : "";
-
-  docXml =
-    docXml.slice(0, bodyOpenEnd) +
-    trimmedBody +
-    sectPr +
-    "</w:body>" +
-    docXml.slice(bodyCloseIdx + "</w:body>".length);
-
-  zip.file("word/document.xml", docXml);
-  return Buffer.from(await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
+  return buffer;
 }
 
 // ─── PPTX preview (first N slides + watermark per slide) ─────────────────────

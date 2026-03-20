@@ -168,8 +168,8 @@ async function buildTextPdf(textBuffer: Buffer): Promise<Buffer> {
 const PARAS_PER_PAGE = 20;
 const MAX_PREVIEW_PAGES = 3;
 
-const WATERMARK_PARAGRAPH = `<w:p><w:pPr><w:jc w:val="center"/><w:pBdr><w:bottom w:val="single" w:sz="4" w:space="4" w:color="D0D0D0"/></w:pBdr><w:spacing w:after="120"/></w:pPr><w:r><w:rPr><w:color w:val="B0B0B0"/><w:sz w:val="18"/><w:szCs w:val="18"/><w:i/><w:iCs/></w:rPr><w:t xml:space="preserve">PREVIEW — ${WATERMARK_TEXT}</w:t></w:r></w:p>`;
-
+// No watermark XML injection — Office Online is too strict about modified DOCX.
+// Content trimming + the "download" message is enough to signal it's a preview.
 const DOWNLOAD_MSG_PARAGRAPH = `<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:before="1200" w:after="200"/></w:pPr><w:r><w:rPr><w:color w:val="999999"/><w:sz w:val="28"/><w:szCs w:val="28"/><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">— Download for the full document —</w:t></w:r></w:p>`;
 
 async function previewDocx(buffer: Buffer): Promise<Buffer> {
@@ -218,10 +218,9 @@ async function previewDocx(buffer: Buffer): Promise<Buffer> {
     trimmedBody = sectPr ? bodyContent.replace(sectPr, "") : bodyContent;
   }
 
-  // Reassemble: watermark + trimmed content + download message + sectPr
+  // Reassemble: trimmed content + download message + sectPr
   docXml =
     docXml.slice(0, bodyOpenEnd) +
-    WATERMARK_PARAGRAPH +
     trimmedBody +
     DOWNLOAD_MSG_PARAGRAPH +
     sectPr +

@@ -168,9 +168,9 @@ async function buildTextPdf(textBuffer: Buffer): Promise<Buffer> {
 const PARAS_PER_PAGE = 20;
 const MAX_PREVIEW_PAGES = 3;
 
-// No watermark XML injection — Office Online is too strict about modified DOCX.
-// Content trimming + the "download" message is enough to signal it's a preview.
-const DOWNLOAD_MSG_PARAGRAPH = `<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:before="1200" w:after="200"/></w:pPr><w:r><w:rPr><w:color w:val="999999"/><w:sz w:val="28"/><w:szCs w:val="28"/><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">— Download for the full document —</w:t></w:r></w:p>`;
+// DOCX preview: trim to top half of content (up to 3 pages), no XML injection.
+// The preview opens directly via signed URL (not Office Online), so we just
+// need a valid truncated DOCX — no watermark or message appended.
 
 async function previewDocx(buffer: Buffer): Promise<Buffer> {
   const JSZip = (await import("jszip")).default;
@@ -192,43 +192,37 @@ async function previewDocx(buffer: Buffer): Promise<Buffer> {
   const paraCountRe = /<w:p[\s>]/g;
   while (paraCountRe.exec(bodyContent) !== null) totalParas++;
 
-  // Estimate pages and determine how many paragraphs to keep (top half)
+  // Keep top half of up to 3 pages worth of paragraphs
   const estimatedPages = Math.max(1, Math.ceil(totalParas / PARAS_PER_PAGE));
   const pagesToPreview = Math.min(estimatedPages, MAX_PREVIEW_PAGES);
-  const parasForPages = pagesToPreview * PARAS_PER_PAGE;
-  const parasToKeep = Math.max(1, Math.floor(parasForPages / 2));
+  const parasToKeep = Math.max(1, Math.floor((pagesToPreview * PARAS_PER_PAGE) / 2));
 
-  // Preserve the sectPr (page layout settings) — always needed at end of body
+  // Short doc — return original unchanged (safest, no XML risk)
+  if (totalParas <= parasToKeep) return buffer;
+
+  // Find cut point and trim
+  const paraRe = /<w:p[\s>]/g;
+  let count = 0;
+  let cutIdx = -1;
+  let m: RegExpExecArray | null;
+  while ((m = paraRe.exec(bodyContent)) !== null) {
+    count++;
+    if (count > parasToKeep) { cutIdx = m.index; break; }
+  }
+  if (cutIdx === -1) return buffer;
+
+  const trimmedBody = bodyContent.slice(0, cutIdx);
   const sectPrMatch = bodyContent.match(/<w:sectPr(?:\s[^>]*)?>[\s\S]*?<\/w:sectPr>/);
   const sectPr = sectPrMatch ? sectPrMatch[0] : "";
 
-  let trimmedBody: string;
-  if (totalParas > parasToKeep) {
-    const paraRe = /<w:p[\s>]/g;
-    let count = 0;
-    let cutIdx = -1;
-    let m: RegExpExecArray | null;
-    while ((m = paraRe.exec(bodyContent)) !== null) {
-      count++;
-      if (count > parasToKeep) { cutIdx = m.index; break; }
-    }
-    trimmedBody = cutIdx !== -1 ? bodyContent.slice(0, cutIdx) : bodyContent;
-  } else {
-    // Short doc — keep all content but remove sectPr (we'll re-append it)
-    trimmedBody = sectPr ? bodyContent.replace(sectPr, "") : bodyContent;
-  }
-
-  // Reassemble: trimmed content + download message + sectPr
   docXml =
     docXml.slice(0, bodyOpenEnd) +
     trimmedBody +
-    DOWNLOAD_MSG_PARAGRAPH +
     sectPr +
     "</w:body>" +
     docXml.slice(bodyCloseIdx + "</w:body>".length);
 
   zip.file("word/document.xml", docXml);
-
   return Buffer.from(await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
 }
 

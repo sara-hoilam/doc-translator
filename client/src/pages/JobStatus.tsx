@@ -785,11 +785,13 @@ export default function JobStatus() {
                           onClick={() => {
                             const url = job.previewFileUrl!;
                             const ext = (url.split("?")[0].split(".").pop() ?? "").toLowerCase();
-                            if (ext === "pdf") {
-                              window.open(url, "_blank", "noopener,noreferrer");
-                            } else {
+                            if (ext === "pptx") {
+                              // PPTX: Office Online embed works for presentations
                               const embedUrl = `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(url)}`;
                               window.open(embedUrl, "docPreview", "width=960,height=720,menubar=no,toolbar=no,location=no,status=no");
+                            } else {
+                              // PDF, DOCX, XLSX: open directly (browser or download)
+                              window.open(url, "_blank", "noopener,noreferrer");
                             }
                           }}
                           className="w-full flex items-center justify-center gap-1.5 border border-[#e5e3dc] bg-[#f9f8f5] hover:bg-[#f0efe9] text-gray-700 text-xs font-medium py-2 rounded-xl transition-colors mb-2.5"

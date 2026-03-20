@@ -409,8 +409,7 @@ export async function generatePreview(
   }
 
   if (fmt === "xlsx") {
-    const preview = await previewXlsx(outputBuffer);
-    return { previewBuffer: preview, previewPages: 1, previewFormat: "xlsx", previewMimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" };
+    return { previewBuffer: outputBuffer, previewPages: 1, previewFormat: "xlsx", previewMimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" };
   }
 
   if (fmt === "txt" || fmt === "csv") {

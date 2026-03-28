@@ -76,6 +76,7 @@ export function isImageFormat(ext: string): ext is ImageInputFormat {
 export function getFormatFromFilename(filename: string): SupportedFormat {
   const ext = path.extname(filename).toLowerCase().replace(".", "");
   if (SUPPORTED_INPUT_FORMATS.includes(ext as any)) return ext as SupportedFormat;
+  if (ext === "pdf") return "pdf";
   // Image formats are converted to PDF before processing
   if (isImageFormat(ext)) return "pdf";
   return "txt";
@@ -1445,20 +1446,19 @@ export async function convertPdfToDocxWithPdf2Docx(
   const {
     Document, Packer, Paragraph, TextRun, ImageRun,
     Table, TableRow, TableCell, WidthType, BorderStyle,
-    AlignmentType, HeadingLevel,
   } = await import("docx");
 
   const doc = (mupdf as any).Document.openDocument(pdfBuffer, "application/pdf");
   const numPages = doc.countPages();
 
+  // A4 page: 11906 twips wide, margins 1080 twips (1.9 cm) each side
+  // Content width in points: (11906 - 2160) / 20 = 487.3 pt
+  const DOCX_CONTENT_W_PT = 487;
+
   // ── helpers ──────────────────────────────────────────────────────────────────
 
-  /** Crop a region from a rendered pixmap and return a PNG Buffer */
   function cropRegionToPng(
-    pixels: Uint8ClampedArray,
-    stride: number,
-    n: number,
-    scale: number,
+    pixels: Uint8ClampedArray, stride: number, n: number, scale: number,
     bbox: { x: number; y: number; w: number; h: number }
   ): Buffer {
     const x0 = Math.round(bbox.x * scale);
@@ -1470,10 +1470,10 @@ export async function convertPdfToDocxWithPdf2Docx(
     const canvas = createCanvas(cropW, cropH);
     const ctx = canvas.getContext("2d");
     const imageData = ctx.createImageData(cropW, cropH);
-    for (let y = 0; y < cropH; y++) {
-      for (let x = 0; x < cropW; x++) {
-        const srcIdx = (y0 + y) * stride + (x0 + x) * n;
-        const dstIdx = (y * cropW + x) * 4;
+    for (let row = 0; row < cropH; row++) {
+      for (let col = 0; col < cropW; col++) {
+        const srcIdx = (y0 + row) * stride + (x0 + col) * n;
+        const dstIdx = (row * cropW + col) * 4;
         imageData.data[dstIdx]     = pixels[srcIdx];
         imageData.data[dstIdx + 1] = pixels[srcIdx + 1];
         imageData.data[dstIdx + 2] = pixels[srcIdx + 2];
@@ -1484,10 +1484,8 @@ export async function convertPdfToDocxWithPdf2Docx(
     return canvas.toBuffer("image/png");
   }
 
-  /** Convert a pt font size to half-points (docx uses half-points) */
   const ptToHalfPt = (pt: number) => Math.round(pt * 2);
 
-  /** Map a font name to bold/italic flags */
   function parseFontFlags(fontName: string, weight: string, style: string) {
     const name = fontName.toLowerCase();
     const bold = weight === "bold" || name.includes("bold") || name.includes("-b") || name.includes("heavy") || name.includes("black");
@@ -1495,28 +1493,36 @@ export async function convertPdfToDocxWithPdf2Docx(
     return { bold, italic };
   }
 
-  /** Build a docx Paragraph from a MuPDF text line */
-  function lineToDocxParagraph(line: any): any {
+  /**
+   * Merge all lines in a text block into a single DOCX paragraph.
+   * Using dominant font from the first line. Lines are joined with a space.
+   */
+  function blockToDocxParagraph(block: any): any | null {
+    const lines: any[] = block.lines ?? [];
+    const texts = lines.map((l: any) => (l.text ?? "").trim()).filter(Boolean);
+    if (!texts.length) return null;
+
+    const firstLine = lines[0];
     const { bold, italic } = parseFontFlags(
-      line.font?.name ?? "",
-      line.font?.weight ?? "normal",
-      line.font?.style ?? "normal"
+      firstLine.font?.name ?? "",
+      firstLine.font?.weight ?? "normal",
+      firstLine.font?.style ?? "normal"
     );
-    const fontSize = line.font?.size ?? 10;
-    const run = new TextRun({
-      text: line.text ?? "",
-      bold,
-      italics: italic,
-      size: ptToHalfPt(fontSize),
-      font: "Calibri", // closest web-safe fallback
-    });
+    const fontSize = firstLine.font?.size ?? 10;
+    const spacingPt = Math.max(4, Math.round(fontSize * 0.4));
+
     return new Paragraph({
-      children: [run],
-      spacing: { before: 0, after: 40 },
+      children: [new TextRun({
+        text: texts.join(" "),
+        bold,
+        italics: italic,
+        size: ptToHalfPt(fontSize),
+        font: "Calibri",
+      })],
+      spacing: { before: spacingPt * 20, after: spacingPt * 20 },
     });
   }
 
-  /** Build a no-border TableCell containing the given children */
   function noBorderCell(children: any[], widthPct: number): any {
     const noBorder = { style: BorderStyle.NONE, size: 0, color: "FFFFFF" };
     return new TableCell({
@@ -1524,6 +1530,200 @@ export async function convertPdfToDocxWithPdf2Docx(
       width: { size: widthPct, type: WidthType.PERCENTAGE },
       borders: { top: noBorder, bottom: noBorder, left: noBorder, right: noBorder },
     });
+  }
+
+  function borderedCell(children: any[], widthPct: number): any {
+    const border = { style: BorderStyle.SINGLE, size: 4, color: "AAAAAA" };
+    return new TableCell({
+      children,
+      width: { size: widthPct, type: WidthType.PERCENTAGE },
+      borders: { top: border, bottom: border, left: border, right: border },
+    });
+  }
+
+  /**
+   * Groups text blocks into horizontal rows by Y-overlap.
+   * Returns sorted rows (top-to-bottom), each row sorted left-to-right.
+   */
+  function groupBlocksIntoRows(textBlocks: any[]): any[][] {
+    if (!textBlocks.length) return [];
+    const sorted = [...textBlocks].sort((a: any, b: any) => a.bbox.y - b.bbox.y);
+    const rows: { blocks: any[]; yMin: number; yMax: number }[] = [];
+    for (const blk of sorted) {
+      const bYMin = blk.bbox.y;
+      const bYMax = blk.bbox.y + blk.bbox.h;
+      let merged = false;
+      for (const row of rows) {
+        // Overlap: block mid-Y is within the row's Y range (with 4pt slack)
+        const midY = (bYMin + bYMax) / 2;
+        if (midY >= row.yMin - 4 && midY <= row.yMax + 4) {
+          row.blocks.push(blk);
+          row.yMin = Math.min(row.yMin, bYMin);
+          row.yMax = Math.max(row.yMax, bYMax);
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) rows.push({ blocks: [blk], yMin: bYMin, yMax: bYMax });
+    }
+    return rows.map(r => r.blocks.sort((a: any, b: any) => a.bbox.x - b.bbox.x));
+  }
+
+  /**
+   * Detects table regions within a list of blocks.
+   * Returns an array of items in reading order: either a detected DOCX Table
+   * element, or a single text/image block to render as-is.
+   */
+  function buildContentItems(
+    sortedBlocks: any[],
+    colWidthPt: number,
+    pdfToDocx: number,
+    renderCtx: { pixels: Uint8ClampedArray; stride: number; n: number; renderScale: number }
+  ): any[] {
+    const textBlocks = sortedBlocks.filter((b: any) => b.type === "text");
+    const rows = groupBlocksIntoRows(textBlocks);
+
+    // Multi-cell rows (potential table rows): rows with ≥2 blocks
+    const multiRows = rows.filter(r => r.length >= 2);
+
+    // Determine if there are enough multi-cell rows to form a table
+    // and if their column X positions are consistent
+    const X_TOL = 18; // pt — column alignment tolerance
+
+    interface TableCandidate {
+      rows: any[][];
+      colXs: number[];
+      blockSet: Set<any>;
+      yStart: number;
+      yEnd: number;
+    }
+
+    const tables: TableCandidate[] = [];
+    if (multiRows.length >= 2) {
+      // Use first multi-row to seed column positions
+      let tableRows = [multiRows[0]];
+      let colXs = multiRows[0].map((b: any) => b.bbox.x as number);
+
+      for (let i = 1; i < multiRows.length; i++) {
+        const row = multiRows[i];
+        const rowXs = row.map((b: any) => b.bbox.x as number);
+        // Check alignment: at least half the row's blocks align to known columns
+        const aligned = rowXs.filter(rx => colXs.some(cx => Math.abs(rx - cx) < X_TOL)).length;
+        if (aligned >= Math.max(1, Math.floor(rowXs.length * 0.5))) {
+          tableRows.push(row);
+          // Expand column set with any new columns in this row
+          for (const rx of rowXs) {
+            if (!colXs.some(cx => Math.abs(rx - cx) < X_TOL)) colXs.push(rx);
+          }
+          colXs.sort((a, b) => a - b);
+        } else {
+          // Gap in alignment — flush current table candidate if large enough
+          if (tableRows.length >= 2) {
+            const blockSet = new Set(tableRows.flat());
+            tables.push({
+              rows: tableRows,
+              colXs,
+              blockSet,
+              yStart: tableRows[0][0].bbox.y,
+              yEnd: tableRows[tableRows.length - 1][0].bbox.y,
+            });
+          }
+          // Start a new candidate with this row
+          tableRows = [row];
+          colXs = row.map((b: any) => b.bbox.x as number);
+        }
+      }
+      if (tableRows.length >= 2) {
+        const blockSet = new Set(tableRows.flat());
+        tables.push({
+          rows: tableRows,
+          colXs,
+          blockSet,
+          yStart: tableRows[0][0].bbox.y,
+          yEnd: tableRows[tableRows.length - 1][0].bbox.y,
+        });
+      }
+    }
+
+    // Build a set of all blocks consumed by tables
+    const tableBlockSet = new Set(tables.flatMap(t => Array.from(t.blockSet)));
+
+    // Helper: render a single block as DOCX element(s)
+    const { pixels, stride, n, renderScale } = renderCtx;
+    const renderBlock = (block: any): any | null => {
+      if (block.type === "image") {
+        try {
+          const pngBuf = cropRegionToPng(pixels, stride, n, renderScale, block.bbox);
+          const naturalW = Math.round(block.bbox.w * pdfToDocx);
+          const imgW = Math.min(naturalW, colWidthPt - 8);
+          const imgH = Math.round(imgW * (block.bbox.h / block.bbox.w));
+          if (imgW > 10 && imgH > 10) {
+            return new Paragraph({
+              children: [new ImageRun({ data: pngBuf, transformation: { width: imgW, height: imgH }, type: "png" })],
+              spacing: { before: 40, after: 40 },
+            });
+          }
+        } catch { /* skip */ }
+        return null;
+      } else if (block.type === "text") {
+        return blockToDocxParagraph(block);
+      }
+      return null;
+    };
+
+    // Build result in Y order, interleaving tables and standalone blocks
+    const result: any[] = [];
+
+    // Collect all table Y-ranges so we can skip blocks that overlap with them
+    const tableYRanges = tables.map(t => ({ yStart: t.yStart, yEnd: t.yEnd }));
+
+    // Build each table
+    for (const t of tables) {
+      const numCols = t.colXs.length;
+      const colPct = Math.floor(100 / numCols);
+
+      const docxRows = t.rows.map(row => {
+        // Assign each block to the nearest column
+        const cells: any[][] = Array.from({ length: numCols }, () => []);
+        for (const blk of row) {
+          let bestCol = 0;
+          let bestDist = Infinity;
+          t.colXs.forEach((cx, ci) => {
+            const dist = Math.abs(blk.bbox.x - cx);
+            if (dist < bestDist) { bestDist = dist; bestCol = ci; }
+          });
+          const para = blockToDocxParagraph(blk);
+          if (para) cells[bestCol].push(para);
+        }
+        return new TableRow({
+          children: cells.map(cellParas => {
+            if (!cellParas.length) cellParas.push(new Paragraph({ children: [] }));
+            return borderedCell(cellParas, colPct);
+          }),
+        });
+      });
+
+      if (docxRows.length) {
+        result.push({
+          _yPos: t.yStart,
+          _element: new Table({
+            rows: docxRows,
+            width: { size: 100, type: WidthType.PERCENTAGE },
+          }),
+        });
+      }
+    }
+
+    // Add standalone blocks (not part of any table)
+    for (const block of sortedBlocks) {
+      if (tableBlockSet.has(block)) continue;
+      const el = renderBlock(block);
+      if (el) result.push({ _yPos: block.bbox?.y ?? 0, _element: el });
+    }
+
+    // Sort everything by Y position and return elements
+    result.sort((a, b) => a._yPos - b._yPos);
+    return result.map(r => r._element);
   }
 
   const sections: any[] = [];
@@ -1534,106 +1734,88 @@ export async function convertPdfToDocxWithPdf2Docx(
     const page = doc.loadPage(pageIdx);
     const bounds = page.getBounds(); // [x0, y0, x1, y1]
     const pageW = bounds[2] - bounds[0];
+    const pageH = bounds[3] - bounds[1];
 
-    // Render page at 2× for image cropping
-    const scale = 2;
-    const matrix = (mupdf as any).Matrix.scale(scale, scale);
+    const pdfToDocx = DOCX_CONTENT_W_PT / pageW;
+
+    const renderScale = 2;
+    const matrix = (mupdf as any).Matrix.scale(renderScale, renderScale);
     const pixmap = page.toPixmap(matrix, (mupdf as any).ColorSpace.DeviceRGB, false, true);
     const pixels = pixmap.getPixels() as Uint8ClampedArray;
     const stride = pixmap.getStride() as number;
     const n = pixmap.getNumberOfComponents() as number;
+    const renderCtx = { pixels, stride, n, renderScale };
 
-    // Extract structured text
     const stext = page.toStructuredText("preserve-spans,preserve-images");
     const stextJson = JSON.parse(stext.asJSON());
     const blocks: any[] = stextJson.blocks ?? [];
-
-    // Detect column layout: find distinct x-clusters
-    const xPositions = blocks
-      .filter((b: any) => b.type === "text")
-      .flatMap((b: any) => (b.lines ?? []).map((l: any) => l.x as number));
-    const midX = pageW / 2;
-    const leftCount  = xPositions.filter((x: number) => x < midX).length;
-    const rightCount = xPositions.filter((x: number) => x >= midX).length;
-    const isTwoColumn = leftCount > 2 && rightCount > 2 && Math.min(leftCount, rightCount) / Math.max(leftCount, rightCount) > 0.15;
-
-    // Separate blocks into left/right columns (or single column)
-    const leftBlocks: any[]  = [];
-    const rightBlocks: any[] = [];
     const allBlocksSorted = [...blocks].sort((a: any, b: any) => (a.bbox?.y ?? 0) - (b.bbox?.y ?? 0));
 
-    for (const block of allBlocksSorted) {
-      const bx = block.bbox?.x ?? 0;
-      if (!isTwoColumn || bx < midX) {
-        leftBlocks.push(block);
-      } else {
-        rightBlocks.push(block);
+    // ── Top-level column detection (page-level 2-column layout) ──────────────
+    const textBlocks = blocks.filter((b: any) => b.type === "text");
+    let isTwoColumn = false;
+    let columnSplitX = pageW / 2;
+
+    if (textBlocks.length >= 4) {
+      const xStarts = textBlocks.map((b: any) => b.bbox?.x ?? 0);
+      const xEnds   = textBlocks.map((b: any) => (b.bbox?.x ?? 0) + (b.bbox?.w ?? 0));
+      let bestGap = 0;
+      let bestSplitX = -1;
+      const step = pageW * 0.01;
+      for (let testX = pageW * 0.3; testX <= pageW * 0.7; testX += step) {
+        const leftEdge  = Math.max(0,     ...xEnds.filter(x => x <= testX));
+        const rightEdge = Math.min(pageW, ...xStarts.filter(x => x > testX));
+        const gap = rightEdge - leftEdge;
+        if (gap > bestGap) { bestGap = gap; bestSplitX = (leftEdge + rightEdge) / 2; }
+      }
+      if (bestGap > pageW * 0.03 && bestSplitX > 0) {
+        const lBlocks = textBlocks.filter((b: any) => (b.bbox?.x ?? 0) < bestSplitX);
+        const rBlocks = textBlocks.filter((b: any) => (b.bbox?.x ?? 0) >= bestSplitX);
+        if (lBlocks.length >= 2 && rBlocks.length >= 2) {
+          isTwoColumn = true;
+          columnSplitX = bestSplitX;
+        }
       }
     }
 
-    const blocksToChildren = (blist: any[]): any[] => {
-      const children: any[] = [];
-      for (const block of blist) {
-        if (block.type === "image") {
-          // Crop and embed the image
-          try {
-            const pngBuf = cropRegionToPng(pixels, stride, n, scale, block.bbox);
-            const imgW = Math.round((block.bbox.w / pageW) * 650 * 0.9); // scale to ~90% of column width
-            const imgH = Math.round(imgW * (block.bbox.h / block.bbox.w));
-            children.push(
-              new Paragraph({
-                children: [
-                  new ImageRun({ data: pngBuf, transformation: { width: imgW, height: imgH }, type: "png" }),
-                ],
-                spacing: { before: 0, after: 40 },
-              })
-            );
-          } catch {
-            // skip unrenderable images
-          }
-        } else if (block.type === "text") {
-          for (const line of block.lines ?? []) {
-            if ((line.text ?? "").trim()) {
-              children.push(lineToDocxParagraph(line));
-            }
-          }
-        }
-      }
-      return children;
-    };
+    const leftBlocks:  any[] = [];
+    const rightBlocks: any[] = [];
+    for (const block of allBlocksSorted) {
+      const bx = block.bbox?.x ?? 0;
+      if (!isTwoColumn || bx < columnSplitX) leftBlocks.push(block);
+      else rightBlocks.push(block);
+    }
+
+    const leftColPt  = isTwoColumn ? Math.round((columnSplitX / pageW) * DOCX_CONTENT_W_PT) : DOCX_CONTENT_W_PT;
+    const rightColPt = isTwoColumn ? (DOCX_CONTENT_W_PT - leftColPt) : DOCX_CONTENT_W_PT;
 
     let sectionChildren: any[];
 
     if (isTwoColumn) {
-      // Build a borderless 2-column table
-      const leftChildren  = blocksToChildren(leftBlocks);
-      const rightChildren = blocksToChildren(rightBlocks);
-      // Ensure cells are non-empty
-      if (!leftChildren.length)  leftChildren.push(new Paragraph({ children: [] }));
-      if (!rightChildren.length) rightChildren.push(new Paragraph({ children: [] }));
-
-      const table = new Table({
-        rows: [
-          new TableRow({
-            children: [
-              noBorderCell(leftChildren,  60),
-              noBorderCell(rightChildren, 40),
-            ],
-          }),
-        ],
+      const leftItems  = buildContentItems(leftBlocks,  leftColPt,  pdfToDocx, renderCtx);
+      const rightItems = buildContentItems(rightBlocks, rightColPt, pdfToDocx, renderCtx);
+      if (!leftItems.length)  leftItems.push(new Paragraph({ children: [] }));
+      if (!rightItems.length) rightItems.push(new Paragraph({ children: [] }));
+      const leftPct  = Math.round((leftColPt  / DOCX_CONTENT_W_PT) * 100);
+      const rightPct = 100 - leftPct;
+      sectionChildren = [new Table({
+        rows: [new TableRow({ children: [
+          noBorderCell(leftItems,  leftPct),
+          noBorderCell(rightItems, rightPct),
+        ]})],
         width: { size: 100, type: WidthType.PERCENTAGE },
-      });
-      sectionChildren = [table];
+      })];
     } else {
-      sectionChildren = blocksToChildren(leftBlocks);
+      sectionChildren = buildContentItems(allBlocksSorted, DOCX_CONTENT_W_PT, pdfToDocx, renderCtx);
     }
 
     if (!sectionChildren.length) sectionChildren.push(new Paragraph({ children: [] }));
 
+    const docxPageH = Math.round((pageH / pageW) * 11906);
     sections.push({
       properties: {
         page: {
-          size: { width: 11906, height: 16838 }, // A4 in twips
+          size: { width: 11906, height: Math.max(docxPageH, 11906) },
           margin: { top: 720, bottom: 720, left: 1080, right: 1080 },
         },
       },

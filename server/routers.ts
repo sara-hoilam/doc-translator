@@ -587,7 +587,22 @@ async function processJobAsync(
         const langName = job?.targetLanguageName ?? targetLanguage;
         const translateStart = Date.now();
 
-        if (inputFormat === "pptx" && (finalFormat === "pptx" || !outputFormat)) {
+        if (inputFormat === "pdf" && finalFormat === "docx") {
+          // PDF → DOCX: convert layout first, then translate in-place
+          await log(`Converting PDF layout to DOCX (preserving text, images, columns)...`, "info");
+          const convertStart = Date.now();
+          const convertedDocx = await convertPdfToDocxWithPdf2Docx(buffer, async (msg: string) => {
+            await log(msg, "info");
+          });
+          logTiming("PDF to DOCX conversion", convertStart);
+          await log(`PDF converted to DOCX — now translating to ${langName}...`, "info");
+          const translateDocxStart = Date.now();
+          inPlaceBuffer = await translateDocxInPlace(convertedDocx, langName, llm);
+          logTiming("DOCX translation", translateDocxStart);
+          logTiming("PDF→DOCX translation total", translateStart);
+          await updateJobStep(jobId, "translate", { status: "done", completedAt: new Date(), message: `Converted PDF→DOCX and translated to ${langName}` });
+          await log(`PDF translated to ${langName} DOCX — layout and images preserved`, "success");
+        } else if (inputFormat === "pptx" && (finalFormat === "pptx" || !outputFormat)) {
           await log(`Translating PPTX slides to ${langName} (in-place — preserving layout)...`, "info");
           await log(`AI is scanning each slide for text runs, grouping by paragraph for fluent translation...`, "info");
           inPlaceBuffer = await translatePptxInPlace(buffer, langName, llm, async (msg: string) => {

@@ -22,6 +22,7 @@ const ALLOWED_OUTPUT_FORMATS: Record<string, OutputFormat[]> = {
   docx: ["docx", "pdf"],
   xlsx: ["xlsx", "csv"],
   txt:  ["txt"],
+  pdf:  ["docx"],
   // image formats → PDF only
   png:  ["pdf"],
   jpg:  ["pdf"],
@@ -48,7 +49,7 @@ const FORMAT_OPTIONS: FormatOption[] = [
 ];
 
 const INPUT_FORMAT_ICONS: Record<string, string> = {
-  docx: "📝", pptx: "📊", xlsx: "📋", txt: "📃",
+  docx: "📝", pptx: "📊", xlsx: "📋", txt: "📃", pdf: "📄",
   png: "🖼️", jpg: "🖼️", jpeg: "🖼️", webp: "🖼️", gif: "🖼️",
 };
 
@@ -424,7 +425,7 @@ export default function Converter() {
 
   const handleFileSelect = (f: File) => {
     const ext = getExtension(f.name);
-    const SUPPORTED = ["docx", "pptx", "xlsx", "txt", "png", "jpg", "jpeg", "webp", "gif"];
+    const SUPPORTED = ["docx", "pptx", "xlsx", "txt", "pdf", "png", "jpg", "jpeg", "webp", "gif"];
     if (!SUPPORTED.includes(ext)) {
       toast.error(`Unsupported format: .${ext}`); return;
     }
@@ -662,7 +663,7 @@ export default function Converter() {
                   ref={fileInputRef}
                   type="file"
                   className="hidden"
-                  accept=".docx,.pptx,.xlsx,.txt,.png,.jpg,.jpeg,.webp,.gif"
+                  accept=".docx,.pptx,.xlsx,.txt,.pdf,.png,.jpg,.jpeg,.webp,.gif"
                   onChange={(e) => e.target.files?.[0] && handleFileSelect(e.target.files[0])}
                 />
                 {/* Hidden multi-image input */}

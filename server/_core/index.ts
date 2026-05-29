@@ -10,6 +10,7 @@ import { serveStatic, setupVite } from "./vite";
 import { registerStripeWebhook } from "../stripeWebhook";
 import { getJobById, deleteJob } from "../db";
 import { storageDelete } from "../storage";
+import { initTelegramBot } from "../bots/telegram";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -40,6 +41,8 @@ async function startServer() {
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
   // OAuth callback under /api/oauth/callback
   registerOAuthRoutes(app);
+
+  await initTelegramBot(app);
 
   // ── Secure download proxy ────────────────────────────────────────────────
   // Fetches the output file from GCS server-side and streams it to the browser.

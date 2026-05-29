@@ -3,90 +3,23 @@ import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
-import { invokeLLM } from "./_core/llm";
-import { storagePut, storageDelete } from "./storage";
-import { generatePreview } from "./watermark";
-import { calculateDownloadPrice, createDownloadCheckoutSession } from "./stripe";
+import { storageDelete } from "./storage";
+import { createDownloadCheckoutSession } from "./stripe";
 import {
-  createJob, getJobById, updateJob, getUserJobs, getUserById, getAnonUserId,
-  createJobStep, updateJobStep, getJobSteps,
-  appendJobLog, getJobLogs, isJobCancelled, cancelJob, deleteJob,
+  getJobById, updateJob, getUserById, getAnonUserId,
+  appendJobLog, getJobLogs, cancelJob, deleteJob, getJobSteps,
 } from "./db";
 import {
-  extractTextFromBuffer, extractWithLLM, translateWithLLM,
-  translatePptxInPlace, translateDocxInPlace, translateXlsxInPlace,
-  convertDocument, buildTranslatedDocument, convertPdfToPptxWithVision,
-  convertPdfToDocxWithPdf2Docx,
-  makeModelInvoker,
-  getFormatFromFilename, getMimeType, isImageFormat,
   COST_PER_PAGE_EXTRACTION, COST_PER_PAGE_TRANSLATION, COST_PER_PAGE_TOTAL,
   MAX_FILE_SIZE_BYTES, JOB_TIMEOUT_MS, MAX_PAGES_VISION, COST_WARNING_THRESHOLD,
   LANGUAGES, SUPPORTED_INPUT_FORMATS, SUPPORTED_OUTPUT_FORMATS, AVAILABLE_MODELS,
   type SupportedFormat,
 } from "./docProcessor";
-
-// ─── Image → PDF conversion ───────────────────────────────────────────────────
-async function convertImageToPdf(imageBuffer: Buffer, mimeType: string): Promise<Buffer> {
-  const sharp = (await import("sharp")).default;
-  const { PDFDocument } = await import("pdf-lib");
-
-  // Use sharp to get image dimensions and convert to PNG for embedding
-  const meta = await sharp(imageBuffer).metadata();
-  const width = meta.width ?? 800;
-  const height = meta.height ?? 600;
-
-  // Convert to PNG bytes for pdf-lib embedding
-  const pngBuf = await sharp(imageBuffer).png().toBuffer();
-  const pngBytes = new Uint8Array(pngBuf.buffer, pngBuf.byteOffset, pngBuf.byteLength);
-
-  const pdfDoc = await PDFDocument.create();
-  const pngImage = await pdfDoc.embedPng(pngBytes);
-
-  // Create a page with the same dimensions as the image (in points, 1pt = 1px at 72dpi)
-  const page = pdfDoc.addPage([width, height]);
-  page.drawImage(pngImage, { x: 0, y: 0, width, height });
-
-  const pdfBytes = await pdfDoc.save();
-  const pdfBuf = Buffer.allocUnsafe(pdfBytes.byteLength);
-  pdfBuf.set(pdfBytes);
-  return pdfBuf;
-}
-
-// ─── Multi-image → single PDF ───────────────────────────────────────────────
-async function convertMultipleImagesToPdf(imageBuffers: Buffer[], mimeTypes: string[]): Promise<Buffer> {
-  const sharp = (await import("sharp")).default;
-  const { PDFDocument } = await import("pdf-lib");
-
-  const pdfDoc = await PDFDocument.create();
-
-  for (let i = 0; i < imageBuffers.length; i++) {
-    const imgBuf = imageBuffers[i];
-    const mime = mimeTypes[i] ?? "image/png";
-
-    // Get dimensions
-    const meta = await sharp(imgBuf).metadata();
-    const width = meta.width ?? 800;
-    const height = meta.height ?? 600;
-
-    // Always convert to PNG for reliable pdf-lib embedding
-    const pngBuf = await sharp(imgBuf).png().toBuffer();
-    const pngBytes = new Uint8Array(pngBuf.buffer, pngBuf.byteOffset, pngBuf.byteLength);
-
-    const pngImage = await pdfDoc.embedPng(pngBytes);
-    const page = pdfDoc.addPage([width, height]);
-    page.drawImage(pngImage, { x: 0, y: 0, width, height });
-  }
-
-  const pdfBytes = await pdfDoc.save();
-  const pdfBuf = Buffer.allocUnsafe(pdfBytes.byteLength);
-  pdfBuf.set(pdfBytes);
-  return pdfBuf;
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-function nanoid(len = 12) {
-  return Math.random().toString(36).slice(2, 2 + len);
-}
+import {
+  startDocumentJob,
+  convertMultipleImagesToPdf,
+  scheduleJobProcessing,
+} from "./documentJob";
 
 // ─── Routers ──────────────────────────────────────────────────────────────────
 export const appRouter = router({
@@ -151,15 +84,7 @@ export const appRouter = router({
         multiImageBase64: z.array(z.string()).optional(),
         multiImageMimeTypes: z.array(z.string()).optional(),
       }))
-      .mutation(async ({ ctx, input }) => {
-        let processBuffer: Buffer;
-        let processFilename: string;
-        let processMimeType: string;
-
-        // Track whether the input was an image (skip text extraction later)
-        let isImageInput = false;
-
-        // ── Multi-image merge path ──────────────────────────────────────────
+      .mutation(async ({ input }) => {
         if (input.multiImageBase64 && input.multiImageBase64.length > 0) {
           const imageBuffers = input.multiImageBase64.map(b64 => Buffer.from(b64, "base64") as Buffer);
           const mimeTypes = input.multiImageMimeTypes ?? imageBuffers.map(() => "image/png");
@@ -167,113 +92,29 @@ export const appRouter = router({
           if (totalSize > MAX_FILE_SIZE_BYTES * 5) {
             throw new Error(`Total image size too large: ${(totalSize / 1024 / 1024).toFixed(1)} MB.`);
           }
-          processBuffer = await convertMultipleImagesToPdf(imageBuffers, mimeTypes);
-          processFilename = "merged-images.pdf";
-          processMimeType = "application/pdf";
-          isImageInput = true;
-        } else {
-          // ── Single file path ────────────────────────────────────────────────
-          const buffer = Buffer.from(input.base64Data, "base64");
-
-          // Server-side file size guard
-          if (buffer.length > MAX_FILE_SIZE_BYTES) {
-            throw new Error(`File too large: ${(buffer.length / 1024 / 1024).toFixed(1)} MB. Maximum allowed is ${MAX_FILE_SIZE_BYTES / 1024 / 1024} MB.`);
-          }
-
-          const rawExt = input.filename.split(".").pop()?.toLowerCase() ?? "";
-          processBuffer = buffer as Buffer;
-          processFilename = input.filename;
-          processMimeType = input.mimeType;
-
-          // Convert image inputs to PDF before processing
-          if (isImageFormat(rawExt)) {
-            processBuffer = await convertImageToPdf(buffer as Buffer, input.mimeType);
-            processFilename = input.filename.replace(/\.[^.]+$/, ".pdf");
-            processMimeType = "application/pdf";
-            isImageInput = true;
-          }
+          const processBuffer = await convertMultipleImagesToPdf(imageBuffers, mimeTypes);
+          const { jobId } = await startDocumentJob({
+            filename: input.filename || "merged-images.pdf",
+            mimeType: "application/pdf",
+            buffer: processBuffer,
+            outputFormat: input.outputFormat ?? "pdf",
+            targetLanguage: input.targetLanguage,
+            targetLanguageName: input.targetLanguageName,
+            modelId: input.modelId,
+          });
+          return { jobId };
         }
 
-        const format = getFormatFromFilename(processFilename);
-        const fileKey = `uploads/anon/${nanoid()}_${processFilename}`;
-
-        // Create the job record immediately — we don't block on GCS upload.
-        // processJobAsync receives the buffer directly so it can start right away.
-        // The GCS upload runs in the background and updates originalFileUrl once
-        // done so the "resume job" flow (which re-fetches from GCS) still works.
-        const anonUserId = await getAnonUserId();
-        const jobId = await createJob({
-          userId: anonUserId,
-          originalFileName: input.filename,
-          originalFileKey: fileKey,
-          originalFileUrl: "",   // filled in by background GCS upload below
-          originalFormat: format,
-          outputFormat: input.outputFormat ?? format,
+        const buffer = Buffer.from(input.base64Data, "base64");
+        const { jobId } = await startDocumentJob({
+          filename: input.filename,
+          mimeType: input.mimeType,
+          buffer,
+          outputFormat: input.outputFormat,
           targetLanguage: input.targetLanguage,
           targetLanguageName: input.targetLanguageName,
-          status: "pending",
+          modelId: input.modelId,
         });
-
-        // Create all step records in parallel (saves multiple DB round-trips)
-        await Promise.all([
-          createJobStep(jobId, "upload"),
-          createJobStep(jobId, "extract"),
-          ...(input.targetLanguage ? [createJobStep(jobId, "translate")] : []),
-          ...(input.outputFormat && input.outputFormat !== format ? [createJobStep(jobId, "convert")] : []),
-        ]);
-
-        // Mark upload done + emit log in parallel
-        await Promise.all([
-          updateJobStep(jobId, "upload", { status: "done", completedAt: new Date() }),
-          appendJobLog(jobId, "success", `File uploaded: ${input.filename} (${(processBuffer.length / 1024).toFixed(0)} KB)`),
-        ]);
-
-        // Background GCS upload — runs concurrently with processJobAsync.
-        // processJobAsync has the buffer in memory so it doesn't need the URL.
-        // The URL is stored in the DB once ready so "resume" can re-fetch the file.
-        storagePut(fileKey, processBuffer, processMimeType)
-          .then(({ url }) => updateJob(jobId, { originalFileUrl: url }))
-          .catch(err => console.error("[GCS] Background original-file upload failed:", err));
-
-        // Kick off async processing with a timeout guard (fire and forget)
-        // On timeout: pause the job instead of killing it, so the user can decide to continue or cancel
-        let timeoutHandle: ReturnType<typeof setTimeout>;
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          timeoutHandle = setTimeout(
-            () => reject(new Error(`__TIMEOUT__`)),
-            JOB_TIMEOUT_MS
-          );
-        });
-        Promise.race([
-          processJobAsync(
-            jobId, processBuffer, format,
-            input.outputFormat as SupportedFormat | undefined,
-            input.targetLanguage,
-            "",   // originalFileUrl not needed for initial run (buffer is in memory)
-            input.modelId,
-            isImageInput,
-          ).then(() => clearTimeout(timeoutHandle)),
-          timeoutPromise,
-        ]).catch(async (err) => {
-          const msg: string = err.message ?? "Unknown error";
-          if (msg === "__TIMEOUT__") {
-            // Before pausing, check if the job already finished successfully
-            const currentJob = await getJobById(jobId).catch(() => null);
-            if (currentJob && ["done", "cancelled", "error"].includes(currentJob.status)) {
-              // Job already finished — timeout fired late, ignore it
-              console.log(`[Job ${jobId}] Timeout fired but job already ${currentJob.status} — ignoring`);
-              return;
-            }
-            console.warn(`[Job ${jobId}] Timed out — pausing for user decision`);
-            await appendJobLog(jobId, "warning", `Job is taking longer than ${JOB_TIMEOUT_MS / 60000} minutes. Paused — waiting for your decision.`).catch(() => {});
-            await updateJob(jobId, { status: "paused", errorMessage: `Paused after ${JOB_TIMEOUT_MS / 60000} minutes` }).catch(() => {});
-          } else {
-            console.error(`[Job ${jobId}] Fatal error:`, err);
-            await appendJobLog(jobId, "error", msg).catch(() => {});
-            await updateJob(jobId, { status: "error", errorMessage: msg }).catch(() => {});
-          }
-        });
-
         return { jobId };
       }),
 
@@ -334,35 +175,13 @@ export const appRouter = router({
         const arrayBuf = await fileResp.arrayBuffer();
         const buffer = Buffer.from(arrayBuf);
 
-        let timeoutHandle: ReturnType<typeof setTimeout>;
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          // Give resumed jobs an extra 10 minutes on top of the original timeout
-          timeoutHandle = setTimeout(
-            () => reject(new Error("__TIMEOUT__")),
-            JOB_TIMEOUT_MS
-          );
-        });
-        Promise.race([
-          processJobAsync(
-            input.jobId,
-            buffer,
-            job.originalFormat as SupportedFormat,
-            job.outputFormat as SupportedFormat | undefined,
-            job.targetLanguage ?? undefined,
-            job.originalFileUrl,
-          ).then(() => clearTimeout(timeoutHandle)),
-          timeoutPromise,
-        ]).catch(async (err) => {
-          const msg: string = err.message ?? "Unknown error";
-          if (msg === "__TIMEOUT__") {
-            const currentJob = await getJobById(input.jobId).catch(() => null);
-            if (currentJob && ["done", "cancelled", "error"].includes(currentJob.status)) return;
-            await appendJobLog(input.jobId, "warning", `Job paused again after ${JOB_TIMEOUT_MS / 60000} minutes. Click Continue to keep processing.`).catch(() => {});
-            await updateJob(input.jobId, { status: "paused", errorMessage: `Paused after ${JOB_TIMEOUT_MS / 60000} minutes` }).catch(() => {});
-          } else {
-            await appendJobLog(input.jobId, "error", msg).catch(() => {});
-            await updateJob(input.jobId, { status: "error", errorMessage: msg }).catch(() => {});
-          }
+        scheduleJobProcessing({
+          jobId: input.jobId,
+          processBuffer: buffer,
+          format: job.originalFormat as SupportedFormat,
+          outputFormat: job.outputFormat as SupportedFormat | undefined,
+          targetLanguage: job.targetLanguage ?? undefined,
+          originalFileUrl: job.originalFileUrl,
         });
 
         return { success: true };
@@ -457,280 +276,3 @@ export const appRouter = router({
 });
 
 export type AppRouter = typeof appRouter;
-
-// ─── Async job processor ──────────────────────────────────────────────────────
-async function processJobAsync(
-  jobId: number,
-  buffer: Buffer,
-  inputFormat: SupportedFormat,
-  outputFormat: SupportedFormat | undefined,
-  targetLanguage: string | undefined,
-  originalFileUrl: string,
-  modelId?: string,
-  isImageInput?: boolean,
-) {
-  // Create a model-aware LLM invoker
-  const llm = makeModelInvoker(invokeLLM, modelId);
-  const startTime = Date.now();
-
-  // Helper: emit a log line to DB
-  const log = (msg: string, level: "info" | "progress" | "success" | "warning" | "error" = "info") =>
-    appendJobLog(jobId, level, msg).catch(() => {});
-
-  // Helper: log timing for a step
-  const logTiming = (stepName: string, startMs: number) => {
-    const duration = Date.now() - startMs;
-    console.log(`[Timing] ${stepName}: ${duration}ms`);
-    return duration;
-  };
-
-  // Helper: check if job was cancelled
-  const checkCancelled = async () => {
-    const cancelled = await isJobCancelled(jobId);
-    if (cancelled) throw new Error("Job cancelled by user");
-  };
-
-  try {
-    const finalFormat = outputFormat ?? inputFormat;
-    // ── STANDARD PIPELINE ─────────────────────────────────────────────────
-
-    // Step 1: Extract text
-    await updateJob(jobId, { status: "extracting" });
-    await updateJobStep(jobId, "extract", { status: "running", startedAt: new Date() });
-
-    let extractedText = "";
-    let pageCount = 1;
-
-    // ── SHORT-CIRCUIT: image inputs have no text layer ──────────────────────
-    if (isImageInput) {
-      await log("Image converted to PDF — no text extraction needed.", "info");
-      await updateJob(jobId, { extractedText: "", pageCount: 1, charCount: 0, estimatedCost: 0 });
-      await updateJobStep(jobId, "extract", { status: "done", completedAt: new Date(), message: "Image converted to PDF (1 page)" });
-      await log("Image embedded as PDF page ✓", "success");
-
-      // No translation or conversion needed for image→PDF — just store the buffer
-      const job = await getJobById(jobId);
-      const outKey = `outputs/${job?.userId}/${nanoid()}_converted.pdf`;
-      const { url: outputUrl } = await storagePut(outKey, buffer, getMimeType("pdf"));
-
-      // Generate preview PDF (first 3 pages)
-      await log("Generating preview...", "info");
-      let imgPreviewUrl: string | undefined;
-      let imgPreviewKey: string | undefined;
-      let imgPreviewPageCount = 0;
-      try {
-        const { previewBuffer, previewPages } = await generatePreview(buffer, "pdf");
-        const pKey = `previews/${job?.userId}/${nanoid()}_preview.pdf`;
-        const { url: pUrl } = await storagePut(pKey, previewBuffer, "application/pdf");
-        imgPreviewUrl = pUrl;
-        imgPreviewKey = pKey;
-        imgPreviewPageCount = previewPages;
-      } catch (e) {
-        console.error("[Preview] Preview generation failed (non-fatal):", e);
-      }
-
-      await updateJob(jobId, {
-        status: "done",
-        outputFileKey: outKey,
-        outputFileUrl: outputUrl,
-        outputFormat: "pdf",
-        previewFileKey: imgPreviewKey,
-        previewFileUrl: imgPreviewUrl,
-        previewPageCount: imgPreviewPageCount,
-        conversionCostUsd: 0,
-        downloadPriceUsd: 0,
-      });
-      await log("Done! Your file is ready to download.", "success");
-      logTiming("Total conversion time", startTime);
-      return;
-    }
-
-    await log(`Extracting text from ${inputFormat.toUpperCase()} document...`, "info");
-    await log(`Parsing document structure and identifying text blocks...`, "info");
-
-    try {
-      await log(`Extracting text locally (fast)...`, "info");
-      await log(`Scanning ${inputFormat.toUpperCase()} for text content, tables, and metadata...`, "info");
-      const extractStart = Date.now();
-      const result = await extractTextFromBuffer(buffer, inputFormat, `doc.${inputFormat}`);
-      logTiming("Text extraction", extractStart);
-      extractedText = result.text;
-      pageCount = result.pageCount;
-    } catch (e) {
-      await log("Extraction failed — falling back to direct text extraction", "warning");
-      const extractStart = Date.now();
-      const result = await extractTextFromBuffer(buffer, inputFormat, `doc.${inputFormat}`);
-      logTiming("Text extraction (fallback)", extractStart);
-      extractedText = result.text;
-      pageCount = result.pageCount;
-    }
-
-    const charCount = extractedText.length;
-    const estimatedCost = pageCount * COST_PER_PAGE_EXTRACTION + (targetLanguage ? pageCount * COST_PER_PAGE_TRANSLATION : 0);
-
-    await updateJob(jobId, { extractedText, pageCount, charCount, estimatedCost });
-    await updateJobStep(jobId, "extract", { status: "done", completedAt: new Date(), message: `Extracted ${pageCount} pages, ${charCount} characters` });
-    await log(`Extracted ${pageCount} page${pageCount !== 1 ? "s" : ""} · ${charCount.toLocaleString()} characters`, "success");
-
-    await checkCancelled();
-
-    // Step 2: Translate
-    let processedText = extractedText;
-    let inPlaceBuffer: Buffer | null = null;
-
-    if (targetLanguage) {
-      await updateJob(jobId, { status: "translating" });
-      await updateJobStep(jobId, "translate", { status: "running", startedAt: new Date() });
-
-      try {
-        const job = await getJobById(jobId);
-        const langName = job?.targetLanguageName ?? targetLanguage;
-        const translateStart = Date.now();
-
-        if (inputFormat === "pdf" && finalFormat === "docx") {
-          // PDF → DOCX: convert layout first, then translate in-place
-          await log(`Converting PDF layout to DOCX (preserving text, images, columns)...`, "info");
-          const convertStart = Date.now();
-          const convertedDocx = await convertPdfToDocxWithPdf2Docx(buffer, async (msg: string) => {
-            await log(msg, "info");
-          });
-          logTiming("PDF to DOCX conversion", convertStart);
-          await log(`PDF converted to DOCX — now translating to ${langName}...`, "info");
-          const translateDocxStart = Date.now();
-          inPlaceBuffer = await translateDocxInPlace(convertedDocx, langName, llm);
-          logTiming("DOCX translation", translateDocxStart);
-          logTiming("PDF→DOCX translation total", translateStart);
-          await updateJobStep(jobId, "translate", { status: "done", completedAt: new Date(), message: `Converted PDF→DOCX and translated to ${langName}` });
-          await log(`PDF translated to ${langName} DOCX — layout and images preserved`, "success");
-        } else if (inputFormat === "pptx" && (finalFormat === "pptx" || !outputFormat)) {
-          await log(`Translating PPTX slides to ${langName} (in-place — preserving layout)...`, "info");
-          await log(`AI is scanning each slide for text runs, grouping by paragraph for fluent translation...`, "info");
-          inPlaceBuffer = await translatePptxInPlace(buffer, langName, llm, async (msg: string) => {
-            await log(msg, "info");
-          });
-          logTiming("PPTX translation", translateStart);
-          await updateJobStep(jobId, "translate", { status: "done", completedAt: new Date(), message: `Translated PPTX in-place to ${langName} (layout preserved)` });
-          await log(`PPTX translated to ${langName} — all images and formatting preserved`, "success");
-        } else if (inputFormat === "docx" && (finalFormat === "docx" || !outputFormat)) {
-          await log(`Translating DOCX to ${langName} (in-place — preserving layout)...`, "info");
-          await log(`AI is processing paragraphs, tables, and headings while keeping styles intact...`, "info");
-          inPlaceBuffer = await translateDocxInPlace(buffer, langName, llm);
-          logTiming("DOCX translation", translateStart);
-          await updateJobStep(jobId, "translate", { status: "done", completedAt: new Date(), message: `Translated DOCX in-place to ${langName} (layout preserved)` });
-          await log(`DOCX translated to ${langName} — all images and formatting preserved`, "success");
-        } else if (inputFormat === "xlsx" && (finalFormat === "xlsx" || !outputFormat)) {
-          await log(`Translating XLSX to ${langName} (in-place — preserving layout)...`, "info");
-          await log(`AI is translating cell content and shared strings while preserving formulas and cell styles...`, "info");
-          inPlaceBuffer = await translateXlsxInPlace(buffer, langName, llm);
-          logTiming("XLSX translation", translateStart);
-          await updateJobStep(jobId, "translate", { status: "done", completedAt: new Date(), message: `Translated XLSX in-place to ${langName} (layout preserved)` });
-          await log(`XLSX translated to ${langName} — all formatting preserved`, "success");
-        } else {
-          await log(`Translating document content to ${langName}...`, "info");
-          await log(`AI is translating ${charCount.toLocaleString()} characters — preserving paragraph structure and formatting marks...`, "info");
-          processedText = await translateWithLLM(extractedText, langName, llm);
-          logTiming("Text translation", translateStart);
-          await updateJobStep(jobId, "translate", { status: "done", completedAt: new Date(), message: `Translated to ${langName} via ${modelId ?? "GPT-4o-mini"}` });
-          await log(`Translation to ${langName} complete`, "success");
-        }
-      } catch (e: any) {
-        await updateJobStep(jobId, "translate", { status: "error", completedAt: new Date(), message: e.message });
-        await log(`Translation failed: ${e.message}`, "error");
-      }
-    }
-
-    await checkCancelled();
-
-    // Step 3: Convert / Build output
-    let outputBuffer: Buffer;
-
-    if (outputFormat && outputFormat !== inputFormat) {
-      await updateJob(jobId, { status: "converting" });
-      await updateJobStep(jobId, "convert", { status: "running", startedAt: new Date() });
-      await log(`Converting to ${finalFormat.toUpperCase()}...`, "info");
-      await log(`Rebuilding document structure in ${finalFormat.toUpperCase()} format...`, "info");
-    }
-
-    if (inPlaceBuffer) {
-      outputBuffer = inPlaceBuffer;
-    } else if (targetLanguage) {
-      await log(`Building ${finalFormat.toUpperCase()} output document...`, "info");
-      outputBuffer = await buildTranslatedDocument(processedText, finalFormat, `translated.${finalFormat}`);
-    } else if (outputFormat && outputFormat !== inputFormat) {
-      outputBuffer = await convertDocument(buffer, inputFormat, finalFormat, `doc.${inputFormat}`);
-    } else {
-      outputBuffer = buffer;
-    }
-
-    if (outputFormat && outputFormat !== inputFormat) {
-      await updateJobStep(jobId, "convert", { status: "done", completedAt: new Date(), message: `Converted to ${finalFormat.toUpperCase()}` });
-      await log(`Converted to ${finalFormat.toUpperCase()} successfully`, "success");
-    }
-
-    // Upload output
-    await log("Finalizing output file...", "info");
-    await log("Uploading to secure storage...", "info");
-    const job = await getJobById(jobId);
-    const outKey = `outputs/${job?.userId}/${nanoid()}_translated.${finalFormat}`;
-    const { url: outputUrl } = await storagePut(outKey, outputBuffer, getMimeType(finalFormat));
-
-    // Mark job as done immediately (don't wait for preview)
-    const finalJob = await getJobById(jobId);
-    const finalCostUsd = finalJob?.estimatedCost ?? 0;
-    const finalDownloadPrice = calculateDownloadPrice(buffer.length, finalCostUsd);
-    await updateJob(jobId, {
-      status: "done",
-      outputFileKey: outKey,
-      outputFileUrl: outputUrl,
-      outputFormat: finalFormat,
-      previewFileKey: undefined,
-      previewFileUrl: undefined,
-      previewPageCount: 0,
-      conversionCostUsd: +finalCostUsd.toFixed(4),
-      downloadPriceUsd: +finalDownloadPrice.toFixed(2),
-    });
-    await log("Done! Your document is ready to download.", "success");
-    logTiming("Total conversion time", startTime);
-
-    // Generate preview in background (non-blocking, with 60s timeout)
-    (async () => {
-      const PREVIEW_TIMEOUT = 60_000;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), PREVIEW_TIMEOUT);
-      try {
-        await log("Generating preview in background...", "info");
-        const previewStart = Date.now();
-        const { previewBuffer, previewPages, previewFormat, previewMimeType } = await generatePreview(outputBuffer, finalFormat);
-        logTiming("Preview generation", previewStart);
-        const pKey = `previews/${job?.userId}/${nanoid()}_preview.${previewFormat}`;
-        console.log(`[Preview] Uploading ${previewFormat} preview (${previewBuffer.length} bytes) to GCS...`);
-        const uploadStart = Date.now();
-        const { url: pUrl } = await storagePut(pKey, previewBuffer, previewMimeType);
-        console.log(`[Preview] Upload complete in ${Date.now() - uploadStart}ms`);
-        await updateJob(jobId, {
-          previewFileKey: pKey,
-          previewFileUrl: pUrl,
-          previewPageCount: previewPages,
-        });
-        await log("Preview ready!", "success");
-      } catch (e: any) {
-        const msg = e?.name === "AbortError" ? "Preview timed out after 60s" : e?.message ?? "Unknown error";
-        console.error("[Preview] Background preview failed:", msg);
-        await log(`Preview generation failed (file still available for download)`, "warning").catch(() => {});
-      } finally {
-        clearTimeout(timeout);
-      }
-    })().catch(() => {});
-
-  } catch (err: any) {
-    console.error(`[Job ${jobId}] Processing failed:`, err);
-    const msg = err.message ?? "Unknown error";
-    if (msg === "Job cancelled by user") {
-      await updateJob(jobId, { status: "cancelled" });
-      await log("Processing stopped.", "warning");
-    } else {
-      await updateJob(jobId, { status: "error", errorMessage: msg });
-      await log(`Error: ${msg}`, "error");
-    }
-  }
-}

@@ -19,6 +19,9 @@ export const ENV = {
   stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? "",
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "",
 
+  // ── Telegram bot ──────────────────────────────────────────────────────────
+  telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? "",
+
   // ── App / Auth ────────────────────────────────────────────────────────────
   cookieSecret: process.env.JWT_SECRET ?? "",
   databaseUrl: process.env.DATABASE_URL ?? "",

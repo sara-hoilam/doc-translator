@@ -4,9 +4,8 @@ import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
 import { storageDelete } from "./storage";
-import { createDownloadCheckoutSession } from "./stripe";
 import {
-  getJobById, updateJob, getUserById, getAnonUserId,
+  getJobById, updateJob,
   appendJobLog, getJobLogs, cancelJob, deleteJob, getJobSteps,
 } from "./db";
 import {
@@ -197,66 +196,6 @@ export const appRouter = router({
         await updateJob(input.jobId, { status: "cancelled", errorMessage: "Cancelled by user after timeout" });
         await appendJobLog(input.jobId, "warning", "Job cancelled by user.");
         return { success: true };
-      }),
-
-    // Create a Stripe checkout session for downloading a completed job
-    createCheckoutSession: publicProcedure
-      .input(z.object({
-        jobId: z.number(),
-        origin: z.string(),
-      }))
-      .mutation(async ({ input, ctx }) => {
-        const job = await getJobById(input.jobId);
-        if (!job) throw new Error("Job not found");
-        if (job.status !== "done") throw new Error("Job is not complete");
-        if (job.paid) return { alreadyPaid: true, checkoutUrl: null };
-
-        // Look up user details for Stripe prefill (if available)
-        let userEmail: string | null = null;
-        let userName: string | null = null;
-        // Try from auth context first, then fall back to DB lookup by job.userId
-        if (ctx.user) {
-          userEmail = ctx.user.email?.trim() || null;
-          userName = ctx.user.name?.trim() || null;
-        } else if (job.userId) {
-          const user = await getUserById(job.userId);
-          userEmail = user?.email?.trim() || null;
-          userName = user?.name?.trim() || null;
-        }
-
-        const downloadPriceUsd = job.downloadPriceUsd ?? 2.0;
-        const checkoutUrl = await createDownloadCheckoutSession({
-          jobId: job.id,
-          userId: job.userId ?? (await getAnonUserId()),
-          userEmail,
-          userName,
-          originalFileName: job.originalFileName,
-          downloadPriceUsd,
-          origin: input.origin,
-        });
-        return { alreadyPaid: false, checkoutUrl };
-      }),
-
-    // Verify payment status for a job (poll after Stripe redirect)
-    verifyPayment: publicProcedure
-      .input(z.object({ jobId: z.number(), sessionId: z.string().optional() }))
-      .query(async ({ input }) => {
-        const job = await getJobById(input.jobId);
-        if (!job) throw new Error("Job not found");
-        // If webhook already marked it paid, return immediately
-        if (job.paid) return { paid: true };
-        // Otherwise check Stripe directly (for cases where webhook is delayed)
-        if (input.sessionId) {
-          try {
-            const { stripe } = await import("./stripe");
-            const session = await stripe.checkout.sessions.retrieve(input.sessionId);
-            if (session.payment_status === "paid") {
-              await updateJob(input.jobId, { paid: true, stripeSessionId: session.id });
-              return { paid: true };
-            }
-          } catch {}
-        }
-        return { paid: false };
       }),
 
     // Permanently delete a job and its S3 files (ephemeral cleanup)

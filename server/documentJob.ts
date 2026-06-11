@@ -1,7 +1,6 @@
 import { invokeLLM } from "./_core/llm";
 import { storagePut } from "./storage";
 import { generatePreview } from "./watermark";
-import { calculateDownloadPrice } from "./stripe";
 import {
   createJob,
   getJobById,
@@ -92,8 +91,6 @@ export interface StartDocumentJobInput {
   targetLanguage?: string;
   targetLanguageName?: string;
   modelId?: string;
-  /** When true, mark job paid on completion (e.g. Telegram bot delivery). */
-  skipPayment?: boolean;
 }
 
 /** Prepare buffer (images→PDF), create DB job, and start background processing. */
@@ -157,7 +154,6 @@ export async function startDocumentJob(input: StartDocumentJobInput): Promise<{ 
     targetLanguage: input.targetLanguage,
     modelId: input.modelId,
     isImageInput,
-    skipPayment: input.skipPayment,
   });
 
   return { jobId };
@@ -172,7 +168,6 @@ export function scheduleJobProcessing(opts: {
   originalFileUrl?: string;
   modelId?: string;
   isImageInput?: boolean;
-  skipPayment?: boolean;
 }): void {
   let timeoutHandle: ReturnType<typeof setTimeout>;
   const timeoutPromise = new Promise<never>((_, reject) => {
@@ -189,7 +184,6 @@ export function scheduleJobProcessing(opts: {
       opts.originalFileUrl ?? "",
       opts.modelId,
       opts.isImageInput,
-      opts.skipPayment,
     ).then(() => clearTimeout(timeoutHandle)),
     timeoutPromise,
   ]).catch(async err => {
@@ -234,7 +228,6 @@ export async function processJobAsync(
   originalFileUrl: string,
   modelId?: string,
   isImageInput?: boolean,
-  skipPayment?: boolean,
 ) {
   const llm = makeModelInvoker(invokeLLM, modelId);
   const startTime = Date.now();
@@ -297,7 +290,7 @@ export async function processJobAsync(
         previewPageCount: imgPreviewPageCount,
         conversionCostUsd: 0,
         downloadPriceUsd: 0,
-        ...(skipPayment ? { paid: true } : {}),
+        paid: true,
       });
       await log("Done! Your file is ready to download.", "success");
       logTiming("Total conversion time", startTime);
@@ -454,15 +447,14 @@ export async function processJobAsync(
 
     const finalJob = await getJobById(jobId);
     const finalCostUsd = finalJob?.estimatedCost ?? 0;
-    const finalDownloadPrice = calculateDownloadPrice(buffer.length, finalCostUsd);
     await updateJob(jobId, {
       status: "done",
       outputFileKey: outKey,
       outputFileUrl: outputUrl,
       outputFormat: finalFormat,
       conversionCostUsd: +finalCostUsd.toFixed(4),
-      downloadPriceUsd: skipPayment ? 0 : +finalDownloadPrice.toFixed(2),
-      ...(skipPayment ? { paid: true } : {}),
+      downloadPriceUsd: 0,
+      paid: true,
     });
     await log("Done! Your document is ready to download.", "success");
     logTiming("Total conversion time", startTime);

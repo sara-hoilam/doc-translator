@@ -123,7 +123,6 @@ async function processUploadedFile(
       outputFormat: outputFormat ?? undefined,
       targetLanguage: session.mode === "translate" ? session.targetLanguage : undefined,
       targetLanguageName: session.mode === "translate" ? session.targetLanguageName : undefined,
-      skipPayment: true,
     });
 
     const job = await waitForJobDone(jobId);

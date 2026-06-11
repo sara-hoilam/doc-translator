@@ -10,14 +10,15 @@ export const ENV = {
   // Provide the key(s) for the model(s) you want to use.
   openaiApiKey: process.env.OPENAI_API_KEY ?? "",
   anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? "",
-  // Google AI Studio key (for Gemini models). Also accepts a GCP API key.
-  googleAiApiKey: process.env.GOOGLE_AI_API_KEY ?? "",
+  // Cursor API key (OpenAI-compatible chat completions).
+  cursorApiKey: process.env.CURSOR_API_KEY ?? "",
+  // Base URL for Cursor chat API (include /v1 if your proxy expects it).
+  cursorApiBaseUrl: process.env.CURSOR_API_BASE_URL ?? "https://api.cursor.com/v1",
   // Which model is used when no modelId is specified by the caller.
-  defaultLlmModel: process.env.DEFAULT_LLM_MODEL ?? "gemini-2.5-flash",
+  defaultLlmModel: process.env.DEFAULT_LLM_MODEL ?? "composer-2.5",
 
-  // ── Stripe ────────────────────────────────────────────────────────────────
-  stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? "",
-  stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "",
+  // ── Telegram bot ──────────────────────────────────────────────────────────
+  telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? "",
 
   // ── App / Auth ────────────────────────────────────────────────────────────
   cookieSecret: process.env.JWT_SECRET ?? "",

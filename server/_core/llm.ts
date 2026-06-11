@@ -3,14 +3,15 @@
  *
  * Routes requests to the correct provider based on the model ID prefix:
  *   claude-*   → Anthropic Messages API
- *   gemini-*   → Google AI (Gemini) via OpenAI-compatible endpoint
+ *   cursor-* / composer-* / gemini-* → Cursor via OpenAI-compatible endpoint
  *   gpt-* / o* → OpenAI Chat Completions API
  *
  * Required env vars (provide the key(s) for the model(s) you use):
+ *   CURSOR_API_KEY
+ *   CURSOR_API_BASE_URL  (default: https://api.cursor.com/v1)
  *   OPENAI_API_KEY
  *   ANTHROPIC_API_KEY
- *   GOOGLE_AI_API_KEY
- *   DEFAULT_LLM_MODEL  (default: "gemini-2.5-flash")
+ *   DEFAULT_LLM_MODEL  (default: "composer-2.5")
  */
 
 import { ENV } from "./env";
@@ -206,14 +207,12 @@ async function invokeOpenAI(model: string, params: InvokeParams): Promise<Invoke
   return (await resp.json()) as InvokeResult;
 }
 
-// ─── Gemini (via OpenAI-compatible endpoint) ──────────────────────────────────
+// ─── Cursor (OpenAI-compatible chat completions) ─────────────────────────────
 
-async function invokeGemini(model: string, params: InvokeParams): Promise<InvokeResult> {
-  const apiKey = ENV.googleAiApiKey;
-  if (!apiKey) throw new Error("GOOGLE_AI_API_KEY is not configured.");
+async function invokeCursor(model: string, params: InvokeParams): Promise<InvokeResult> {
+  const apiKey = ENV.cursorApiKey;
+  if (!apiKey) throw new Error("CURSOR_API_KEY is not configured.");
 
-  // Gemini's OpenAI-compatible endpoint accepts the same payload shape as OpenAI.
-  // PDF / image content is sent as a data URL inside an image_url part.
   const messages: unknown[] = [];
   for (const msg of params.messages) {
     messages.push({
@@ -224,7 +223,6 @@ async function invokeGemini(model: string, params: InvokeParams): Promise<Invoke
   }
 
   const maxTokens = params.maxTokens ?? params.max_tokens ?? 8192;
-
   const payload: Record<string, unknown> = { model, messages, max_tokens: maxTokens };
 
   const rf = params.responseFormat ?? params.response_format;
@@ -235,18 +233,16 @@ async function invokeGemini(model: string, params: InvokeParams): Promise<Invoke
     payload.response_format = { type: "json_schema", json_schema: os };
   }
 
-  const resp = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(payload),
-    }
-  );
+  const base = ENV.cursorApiBaseUrl.replace(/\/$/, "");
+  const resp = await fetch(`${base}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify(payload),
+  });
 
   if (!resp.ok) {
     const err = await resp.text();
-    throw new Error(`Gemini API error ${resp.status}: ${err}`);
+    throw new Error(`Cursor API error ${resp.status}: ${err}`);
   }
 
   return (await resp.json()) as InvokeResult;
@@ -383,15 +379,23 @@ async function invokeAnthropic(model: string, params: InvokeParams): Promise<Inv
  * Route an LLM invocation to the correct provider based on the model ID.
  * Falls back to ENV.defaultLlmModel if no model is specified in params.
  */
+function usesCursorProvider(model: string): boolean {
+  return (
+    model.startsWith("cursor-") ||
+    model.startsWith("composer-") ||
+    model.startsWith("gemini-") // legacy model ids route through Cursor
+  );
+}
+
 export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
-  const model = params.model ?? ENV.defaultLlmModel ?? "gemini-2.5-flash";
+  const model = params.model ?? ENV.defaultLlmModel ?? "composer-2.5";
 
   if (model.startsWith("claude-")) {
     return invokeAnthropic(model, params);
   }
 
-  if (model.startsWith("gemini-")) {
-    return invokeGemini(model, params);
+  if (usesCursorProvider(model)) {
+    return invokeCursor(model, params);
   }
 
   // Default: OpenAI (gpt-*, o1-*, etc.)

@@ -33,12 +33,12 @@ export const AVAILABLE_MODELS = [
   { id: "gpt-4o",                     label: "GPT-4o",              provider: "OpenAI",    tier: "fast"    },
   { id: "gpt-4.1",                    label: "GPT-4.1",             provider: "OpenAI",    tier: "best"    },
   { id: "gpt-4o-mini",                label: "GPT-4o mini",         provider: "OpenAI",    tier: "economy" },
-  { id: "gemini-2.5-flash",           label: "Gemini 2.5 Flash",    provider: "Google",    tier: "fast"    },
-  { id: "gemini-2.0-flash",           label: "Gemini 2.0 Flash",    provider: "Google",    tier: "economy" },
+  { id: "composer-2.5",               label: "Composer 2.5",        provider: "Cursor",    tier: "fast"    },
+  { id: "composer-2",                 label: "Composer 2",          provider: "Cursor",    tier: "economy" },
 ] as const;
 
 export type ModelId = (typeof AVAILABLE_MODELS)[number]["id"];
-export const DEFAULT_MODEL: ModelId = "claude-sonnet-4-6";
+export const DEFAULT_MODEL: ModelId = "composer-2.5";
 
 // ─── Supported formats ───────────────────────────────────────────────────────
 export const SUPPORTED_INPUT_FORMATS = ["docx", "pptx", "xlsx", "txt"] as const;

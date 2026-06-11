@@ -7,9 +7,9 @@ import { registerOAuthRoutes } from "./oauth";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
-import { registerStripeWebhook } from "../stripeWebhook";
 import { getJobById, deleteJob } from "../db";
 import { storageDelete } from "../storage";
+import { initTelegramBot } from "../bots/telegram";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -33,13 +33,13 @@ async function findAvailablePort(startPort: number = 3000): Promise<number> {
 async function startServer() {
   const app = express();
   const server = createServer(app);
-  // Stripe webhook MUST be registered before express.json() to get raw body
-  registerStripeWebhook(app);
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
   // OAuth callback under /api/oauth/callback
   registerOAuthRoutes(app);
+
+  await initTelegramBot(app);
 
   // ── Secure download proxy ────────────────────────────────────────────────
   // Fetches the output file from GCS server-side and streams it to the browser.
@@ -49,8 +49,8 @@ async function startServer() {
     if (isNaN(jobId)) { res.status(400).json({ error: "Invalid job ID" }); return; }
 
     const job = await getJobById(jobId).catch(() => null);
-    if (!job || !job.outputFileUrl || !job.paid) {
-      res.status(404).json({ error: "File not found or not paid" });
+    if (!job || !job.outputFileUrl) {
+      res.status(404).json({ error: "File not found" });
       return;
     }
 

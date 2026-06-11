@@ -2,6 +2,7 @@ import { useParams, Link } from "wouter";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useLocation } from "wouter";
 import { trpc } from "@/lib/trpc";
+import { toast } from "sonner";
 import {
   CheckCircle2, XCircle, Loader2, Clock, Download,
   FileText, Globe, RefreshCw, Upload, ArrowLeft,
@@ -231,58 +232,7 @@ export default function JobStatus() {
     killMutation.mutate({ jobId });
   };
 
-  // ── Payment state ──────────────────────────────────────────────────────────────────
   const [, setLocation] = useLocation();
-  const [paymentPending, setPaymentPending] = useState(false);
-
-  // Read payment query params from URL on mount
-  const urlParams = new URLSearchParams(window.location.search);
-  const paymentStatus = urlParams.get("payment"); // "success" | "cancelled"
-  const stripeSessionId = urlParams.get("session_id") ?? undefined;
-
-  // If Stripe redirected back with success, verify payment
-  const { data: paymentVerification } = trpc.docs.verifyPayment.useQuery(
-    { jobId, sessionId: stripeSessionId },
-    {
-      enabled: !!jobId && paymentStatus === "success" && !!stripeSessionId,
-      refetchInterval: (query) => {
-        // Keep polling until paid confirmed
-        if (query.state.data?.paid) return false;
-        return 2000;
-      },
-    }
-  );
-
-  // Clear payment URL params after processing
-  useEffect(() => {
-    if (paymentStatus && window.history.replaceState) {
-      window.history.replaceState({}, "", window.location.pathname);
-    }
-  }, [paymentStatus]);
-
-  // Track when we're redirecting to Stripe — suppress cleanup beacon during that time
-  const stripeRedirectingRef = useRef(false);
-
-  const checkoutMutation = trpc.docs.createCheckoutSession.useMutation({
-    onSuccess: (data) => {
-      setPaymentPending(false);
-      if (data.alreadyPaid) {
-        utils.docs.status.invalidate({ jobId });
-        return;
-      }
-      if (data.checkoutUrl) {
-        // Mark that we're doing a Stripe redirect so the beforeunload beacon is suppressed
-        stripeRedirectingRef.current = true;
-        window.location.href = data.checkoutUrl;
-      }
-    },
-    onError: () => setPaymentPending(false),
-  });
-
-  const handlePay = useCallback(() => {
-    setPaymentPending(true);
-    checkoutMutation.mutate({ jobId, origin: window.location.origin });
-  }, [jobId, checkoutMutation]);
 
   // ── Ephemeral cleanup mutation ────────────────────────────────────────────
   // Deletes S3 files + DB records so nothing is stored after the user is done.
@@ -337,13 +287,9 @@ export default function JobStatus() {
   };
 
   // Cancel + cleanup when the user closes the tab or navigates away
-  // IMPORTANT: suppress beacon when redirecting to Stripe (we'll return to this page)
   useEffect(() => {
     const handleUnload = () => {
       if (!jobId) return;
-      // If we're redirecting to Stripe checkout, do NOT clean up the job
-      if (stripeRedirectingRef.current) return;
-      // sendBeacon is fire-and-forget and survives page unload
       const body = JSON.stringify({ json: { jobId } });
       const blob = new Blob([body], { type: "application/json" });
       navigator.sendBeacon("/api/trpc/docs.cancel", blob);
@@ -357,17 +303,6 @@ export default function JobStatus() {
   const steps = data?.steps ?? [];
   const isPaused = job?.status === "paused";
   const isProcessing = job && !isFinished && !isPaused;
-
-  // Poll payment status when job is done (catches webhook-confirmed payments)
-  const { data: paidStatus } = trpc.docs.verifyPayment.useQuery(
-    { jobId },
-    {
-      enabled: !!jobId && job?.status === "done" && !paymentVerification?.paid,
-      refetchInterval: 5000,
-    }
-  );
-
-  const isPaid = job?.paid || paymentVerification?.paid || paidStatus?.paid || false;
 
   const getStepStatus = (stepName: string) => steps.find(s => s.step === stepName);
 
@@ -742,92 +677,51 @@ export default function JobStatus() {
                     </div>
                   </div>
 
-                  {/* Payment gate */}
-                  {isPaid ? (
-                    // Paid — show download + open
-                    <div className="flex gap-2">
-                      <button
-                        onClick={openFilenameDialog}
-                        disabled={isDownloading}
-                        className="flex-1 flex items-center justify-center gap-1.5 bg-gray-800 hover:bg-gray-900 disabled:opacity-60 text-white text-xs font-medium py-2 rounded-xl transition-colors"
-                      >
-                        <Download className="h-3.5 w-3.5" />
-                        {isDownloading ? "Downloading..." : "Download"}
-                      </button>
-                      {job.outputFileUrl ? (
-                        <a
-                          href={getOnlineViewerUrl(job.outputFormat ?? job.originalFormat, job.outputFileUrl)}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="flex items-center justify-center gap-1.5 border border-[#e5e3dc] bg-white hover:bg-[#f5f4f0] text-gray-700 text-xs font-medium px-3 py-2 rounded-xl transition-colors"
-                        >
-                          <ExternalLink className="h-3.5 w-3.5" />
-                          Open
-                        </a>
-                      ) : (
-                        <button
-                          onClick={openFilenameDialog}
-                          disabled={isDownloading}
-                          className="flex items-center justify-center gap-1.5 border border-[#e5e3dc] bg-white hover:bg-[#f5f4f0] disabled:opacity-60 text-gray-700 text-xs font-medium px-3 py-2 rounded-xl transition-colors"
-                          title="File URL not available, use Download instead"
-                        >
-                          <Download className="h-3.5 w-3.5" />
-                          Download
-                        </button>
-                      )}
-                    </div>
+                  {job.previewFileUrl ? (
+                    <button
+                      onClick={() => {
+                        const url = job.previewFileUrl!;
+                        const ext = (url.split("?")[0].split(".").pop() ?? "").toLowerCase();
+                        if (ext === "pptx") {
+                          const embedUrl = `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(url)}`;
+                          window.open(embedUrl, "docPreview", "width=960,height=720,menubar=no,toolbar=no,location=no,status=no");
+                        } else {
+                          window.open(url, "_blank", "noopener,noreferrer");
+                        }
+                      }}
+                      className="w-full flex items-center justify-center gap-1.5 border border-[#e5e3dc] bg-[#f9f8f5] hover:bg-[#f0efe9] text-gray-700 text-xs font-medium py-2 rounded-xl transition-colors mb-2.5"
+                    >
+                      <Eye className="h-3.5 w-3.5" />
+                      Preview ({job.previewPageCount ?? 3} pages)
+                    </button>
                   ) : (
-                    // Not paid — show price + pay button
-                    <div>
-                      {/* Preview button — opens Office Online in a popup */}
-                      {job.previewFileUrl ? (
-                        <button
-                          onClick={() => {
-                            const url = job.previewFileUrl!;
-                            const ext = (url.split("?")[0].split(".").pop() ?? "").toLowerCase();
-                            if (ext === "pptx") {
-                              // PPTX: Office Online embed works for presentations
-                              const embedUrl = `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(url)}`;
-                              window.open(embedUrl, "docPreview", "width=960,height=720,menubar=no,toolbar=no,location=no,status=no");
-                            } else {
-                              // PDF, DOCX, XLSX: open directly (browser or download)
-                              window.open(url, "_blank", "noopener,noreferrer");
-                            }
-                          }}
-                          className="w-full flex items-center justify-center gap-1.5 border border-[#e5e3dc] bg-[#f9f8f5] hover:bg-[#f0efe9] text-gray-700 text-xs font-medium py-2 rounded-xl transition-colors mb-2.5"
-                        >
-                          <Eye className="h-3.5 w-3.5" />
-                          Preview ({job.previewPageCount ?? 3} pages)
-                        </button>
-                      ) : job.status === "done" ? (
-                        <div className="w-full flex items-center justify-center gap-1.5 text-xs text-gray-400 py-2 mb-2.5">
-                          <Loader2 className="h-3 w-3 animate-spin" />
-                          Generating preview…
-                        </div>
-                      ) : null}
-
-                      <div className="flex items-center justify-between mb-2.5 px-1">
-                        <span className="text-xs text-gray-500">Download fee</span>
-                        <span className="text-base font-bold text-gray-900">
-                          ${(job.downloadPriceUsd ?? 2).toFixed(2)}
-                        </span>
-                      </div>
-                      <button
-                        onClick={handlePay}
-                        disabled={paymentPending}
-                        className="w-full flex items-center justify-center gap-1.5 bg-gray-900 hover:bg-black text-white text-xs font-semibold py-2.5 rounded-xl transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
-                      >
-                        {paymentPending ? (
-                          <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Redirecting to payment...</>
-                        ) : (
-                          <><Download className="h-3.5 w-3.5" /> Pay & Download</>
-                        )}
-                      </button>
-                      <p className="text-[10px] text-gray-400 text-center mt-1.5">
-                        Secure payment via Stripe
-                      </p>
+                    <div className="w-full flex items-center justify-center gap-1.5 text-xs text-gray-400 py-2 mb-2.5">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      Generating preview…
                     </div>
                   )}
+
+                  <div className="flex gap-2">
+                    <button
+                      onClick={openFilenameDialog}
+                      disabled={isDownloading}
+                      className="flex-1 flex items-center justify-center gap-1.5 bg-gray-800 hover:bg-gray-900 disabled:opacity-60 text-white text-xs font-medium py-2 rounded-xl transition-colors"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      {isDownloading ? "Downloading..." : "Download"}
+                    </button>
+                    {job.outputFileUrl ? (
+                      <a
+                        href={getOnlineViewerUrl(job.outputFormat ?? job.originalFormat, job.outputFileUrl)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center justify-center gap-1.5 border border-[#e5e3dc] bg-white hover:bg-[#f5f4f0] text-gray-700 text-xs font-medium px-3 py-2 rounded-xl transition-colors"
+                      >
+                        <ExternalLink className="h-3.5 w-3.5" />
+                        Open
+                      </a>
+                    ) : null}
+                  </div>
                 </div>
               </>
             )}
